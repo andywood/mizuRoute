@@ -23,6 +23,8 @@ implicit none
 private
 public :: init_mpi
 public :: init_data
+public :: infile_name
+public :: inFile_pop
 
 CONTAINS
 
@@ -120,6 +122,9 @@ CONTAINS
    ! local:
    character(len=strLen)                    :: cmessage         ! error message of downwind routine
 
+   ! initialize error control
+   ierr=0; message='init_runoff_data/'
+
    if (pid==0) then
      ! runoff and remap data initialization (TO DO: split runoff and remap initialization)
      call init_runoff(is_remap,        & ! input:  logical whether or not runnoff needs to be mapped to river network HRU
@@ -128,14 +133,306 @@ CONTAINS
                       ierr, cmessage)    ! output: error control
      if(ierr/=0)then; message=trim(message)//trim(cmessage); return; endif
 
-     ! DateTime initialization
-     call init_time(runoff_data%ntime, ierr, cmessage)
-     if(ierr/=0)then; message=trim(message)//trim(cmessage); return; endif
+   !  ! DateTime initialization
+   !  call init_time(runoff_data%ntime, ierr, cmessage)
+   !  if(ierr/=0)then; message=trim(message)//trim(cmessage); return; endif
 
    end if  ! if processor=0 (root)
 
  END SUBROUTINE init_runoff_data
 
+ ! *********************************************************************
+ ! private subroutine: read the name of the netcdf files, populates the
+ ! filed of inFiledata dataType assuming the calendar, time units, e.g. days
+ ! since yyyy-mm-dd hh:mm:ss, of all the files are identical
+ ! *********************************************************************
+ SUBROUTINE inFile_pop(ierr, message)  ! output
+
+  ! data types
+  USE dataTypes, ONLY: infileinfo
+  USE io_netcdf, only:get_nc
+  USE io_netcdf, only:get_var_attr
+  USE io_netcdf, only:get_nc_dim_len
+
+  ! subroutines
+  USE process_time_module, ONLY: process_time  ! process time information
+  USE ascii_util_module, ONLY:file_open        ! open file (performs a few checks as well)
+  USE ascii_util_module, ONLY:get_vlines       ! get a list of character strings from non-comment lines
+
+  ! Shared data
+  USE public_var, ONLY: input_dir       ! directory containing input data
+  USE public_var, ONLY: fname_qsim      ! simulated runoff txt file that includes the NetCDF file names
+  USE public_var, ONLY: vname_time      ! variable name for time
+  USE public_var, ONLY: time_units      ! time units (seconds, hours, or days)
+  USE public_var, ONLY: dname_time      !
+  USE public_var, ONLY: calendar        ! calendar name
+  USE globalData, ONLY: timeVar         ! time variables (unit given by runoff data)
+  USE globalData, ONLY: refJulday       ! julian day: reference
+  USE globalData, ONLY: roJulday        ! julian day: runoff input time
+  USE globalData, ONLY: infileinfo_data ! the information of the input files
+
+  ! output: error control
+  integer(i4b),         intent(out)    :: ierr             ! error code
+  character(*),         intent(out)    :: message          ! error message
+
+  ! local varibales
+  real(dp)                             :: convTime2Days
+  character(len=7)                     :: t_unit
+  character(len=strLen)                :: infilename            ! input filename
+  integer(i4b)                         :: unt                   ! file unit (free unit output from file_open)
+  character(len=strLen),allocatable    :: dataLines(:)          ! vector of lines of information (non-comment lines)
+  integer(i4b)                         :: iFile                 ! counter for forcing files
+  integer(i4b)                         :: nFile                 ! number of forcing files in forcing file list
+  character(len=strLen)                :: filenameData          ! name of forcing datafile
+  integer(i4b)                         :: nTime, nt             ! number of time step per file and all files, respectively
+  character(len=strLen)                :: cmessage              ! error message of downwind routine
+  integer(i4b)                         :: counter               ! counter
+
+  ! initialize error control
+  ierr=0; message='inFile_pop/'
+
+  ! build filename and its path containing list of NetCDF files
+  infilename = trim(input_dir)//trim(fname_qsim)
+
+  ! open file
+  call file_open(trim(infilename),unt,ierr,cmessage)
+  if(ierr/=0)then; message=trim(message)//trim(cmessage); return; end if
+
+  ! get a list of character strings from non-comment lines
+  call get_vlines(unt,dataLines,ierr,cmessage)
+  if(ierr/=0)then; ierr=20; message=trim(message)//trim(cmessage); return; end if
+  nFile = size(dataLines) ! get the name of the lines in the file
+
+  ! allocate space for forcing information
+  allocate(infileinfo_data(nFile), stat=ierr)
+  if(ierr/=0)then; ierr=20; message=trim(message)//'problem allocating space for forcFileInfo'; return; end if
+
+  ! poputate the forcingInfo structure with filenames, julian day of sart and end of the simulation
+  do iFile=1,nFile
+
+   ! split the line into "words" (expect one word: the file describing forcing data for that index)
+   read(dataLines(iFile),*,iostat=ierr) filenameData
+   if(ierr/=0)then; message=trim(message)//'problem reading a line of data from file ['//trim(infilename)//']'; return; end if
+
+   ! set forcing file name
+   infileinfo_data(iFile)%infilename = trim(filenameData)
+   print*, 'iFile, nFile, infileinfo_data(iFile)%infilename = ', iFile, nFile, trim(infileinfo_data(iFile)%infilename)
+
+   ! get the time units
+   call get_var_attr(trim(input_dir)//trim(infileinfo_data(iFile)%infilename), &
+                     trim(vname_time), 'units', infileinfo_data(iFile)%unit, ierr, cmessage)
+   if(ierr/=0)then; message=trim(message)//trim(cmessage); return; endif
+   print*, "unit is ", infileinfo_data(iFile)%unit
+
+   ! get the calendar
+   call get_var_attr(trim(input_dir)//trim(infileinfo_data(iFile)%infilename), &
+                          trim(vname_time), 'calendar', infileinfo_data(iFile)%calendar, ierr, cmessage)
+   if(ierr/=0)then; message=trim(message)//trim(cmessage); return; endif
+!   print*, "calendar is ", infileinfo_data(iFile)%calendar
+
+   ! how to get the dimension of the time to populate nTime and pass it to the get_nc file
+   call get_nc_dim_len(trim(input_dir)//trim(infileinfo_data(iFile)%infilename), &
+                       trim(dname_time), infileinfo_data(iFile)%nTime, ierr, cmessage)
+   if(ierr/=0)then; message=trim(message)//trim(cmessage); return; endif
+   nTime = infileinfo_data(iFile)%nTime
+
+   ! allocate space for time varibale of each file
+   if(allocated(infileinfo_data(iFile)%timeVar)) deallocate(infileinfo_data(iFile)%timeVar)
+   allocate(infileinfo_data(iFile)%timeVar(nTime))
+
+   ! get the time varibale
+   call get_nc(trim(input_dir)//trim(infileinfo_data(iFile)%infilename), &
+               vname_time, infileinfo_data(iFile)%timeVar, 1, nTime, ierr, cmessage) ! does it needs timeVar(:)
+
+   ! get the time multiplier needed to convert time to units of days for each file
+   t_unit = trim( infileinfo_data(iFile)%unit(1:index(infileinfo_data(iFile)%unit,' ')) )
+   select case( trim(t_unit) )
+    case('seconds','second','sec','s'); convTime2Days=86400._dp
+    case('minutes','minute','min');     convTime2Days=1440._dp
+    case('hours','hour','hr','h');      convTime2Days=24._dp
+    case('days','day','d');             convTime2Days=1._dp
+    case default
+      ierr=20; message=trim(message)//'<time_units>= '//trim(t_unit)//': <time_units> must be seconds, minutes, hours or days.'; return
+   end select
+   infileinfo_data(iFile)%convTime2Days = convTime2Days
+
+   ! populated the index of the iTime for each nc file
+   if (iFile==1) then
+    infileinfo_data(iFile)%iTimebound(1) = 1
+    infileinfo_data(iFile)%iTimebound(2) = size(infileinfo_data(iFile)%timeVar)
+   else
+    infileinfo_data(iFile)%iTimebound(1) = infileinfo_data(iFile-1)%iTimebound(2) + 1 ! the last index from the perivous nc file + 1
+    infileinfo_data(iFile)%iTimebound(2) = infileinfo_data(iFile-1)%iTimebound(2) + nTime ! the last index from the perivous nc file + 1
+   endif
+
+   print*, "time bound = ",infileinfo_data(iFile)%iTimebound
+
+   ! Compute reference Julian day for each nc file
+   call process_time(trim(infileinfo_data(iFile)%unit), infileinfo_data(iFile)%calendar,  infileinfo_data(iFile)%refJulday, ierr, cmessage)
+   if(ierr/=0) then; message=trim(message)//trim(cmessage)//' [refJulday]'; return; endif
+
+  enddo
+
+  ! close ascii file
+  close(unit=unt,iostat=ierr); if(ierr/=0)then;message=trim(message)//'problem closing forcing file list'; return; end if
+
+  time_units    = infileinfo_data(1)%unit
+  calendar      = infileinfo_data(1)%calendar
+  refJulday     = infileinfo_data(1)%refJulday
+  convTime2Days = infileinfo_data(1)%convTime2Days
+
+  ! find the total length of the timeVar
+  nt = 0; ! counter
+  do iFile=1,nFile
+   nt = nt + infileinfo_data(iFile)%nTime
+  enddo
+!  print*, "size of the time var: ", counter ! the total number of time steps in input files from first to last
+
+  ! allocate the timeVar
+  allocate(timeVar(nt), roJulday(nt), stat=ierr) ! what is the allocate stat?
+
+  ! pass the time var from each file into the global time var
+  counter = 1; ! counter
+  do iFile=1,nFile
+   nTime = infileinfo_data(iFile)%nTime
+   roJulday(counter:counter+nTime-1) = infileinfo_data(iFile)%refJulday + infileinfo_data(iFile)%timeVar(1:nTime)/infileinfo_data(iFile)%convTime2Days
+   counter = counter + nTime
+  enddo
+  timeVar(1:nt) = (roJulday(1:nt) - refJulday)*convTime2Days
+
+  ! passing the first nc file as global netCDF file
+  fname_qsim = trim(infileinfo_data(1)%infilename)
+
+  ! call init_time_new to get the first iTime
+  call init_time_new(ierr, cmessage)
+
+ END SUBROUTINE inFile_pop
+
+
+ ! *********************************************************************
+ ! private subroutine: initialize time data modifeid based on infile pop
+ ! *********************************************************************
+ SUBROUTINE init_time_new(ierr, message)  ! output
+
+  ! subroutines:
+  USE process_time_module, ONLY: process_time  ! process time information
+  USE io_netcdf,           ONLY: get_nc        ! netcdf input
+  ! derived datatype
+  USE dataTypes, ONLY: time           ! time data type
+  ! Shared data
+  USE public_var, ONLY: simStart      ! date string defining the start of the simulation
+  USE public_var, ONLY: simEnd        ! date string defining the end of the simulation
+  USE public_var, ONLY: calendar      ! calendar name
+  USE public_var, ONLY: restart_write ! restart write option
+  USE public_var, ONLY: restart_date  ! restart date
+  USE globalData, ONLY: timeVar       ! time variables (unit given by runoff data)
+  USE globalData, ONLY: iTime         ! time index at simulation time step
+  USE globalData, ONLY: startJulday   ! julian day: start of routing simulation
+  USE globalData, ONLY: endJulday     ! julian day: end of routing simulation
+  USE globalData, ONLY: modJulday     ! julian day: at model time step
+  USE globalData, ONLY: roJulday      ! julian day: runoff input time
+  USE globalData, ONLY: restartJulday ! julian day: at restart
+  USE globalData, ONLY: modTime       ! model time data (yyyy:mm:dd:hh:mm:ss)
+  USE globalData, ONLY: infileinfo_data ! the information of the input files
+
+  implicit none
+
+  ! output: error control
+  integer(i4b),              intent(out)   :: ierr             ! error code
+  character(*),              intent(out)   :: message          ! error message
+  ! local variable
+  integer(i4b)                             :: ix
+  character(len=strLen)                    :: cmessage         ! error message of downwind routine
+
+  ! initialize error control
+  ierr=0; message='init_time_new/'
+
+  ! extract time information from the control information
+  call process_time(trim(simStart),calendar, startJulday, ierr, cmessage)
+  if(ierr/=0) then; message=trim(message)//trim(cmessage)//' [startJulday]'; return; endif
+  call process_time(trim(simEnd),  calendar, endJulday,   ierr, cmessage)
+  if(ierr/=0) then; message=trim(message)//trim(cmessage)//' [endJulday]'; return; endif
+
+  ! check that the dates are aligned
+  if(endJulday<startJulday) then; ierr=20; message=trim(message)//'simulation end is before simulation start'; return; endif
+
+  ! fast forward time to time index at simStart and save iTime and modJulday
+  ! need to convert time unit in timeVar to day
+  do ix = 1, size(timeVar)
+    modJulday = roJulday(ix)
+    if( modJulday < startJulday ) cycle
+    exit
+  enddo
+  iTime = ix
+
+  ! initialize previous model time
+  modTime(0) = time(integerMissing, integerMissing, integerMissing, integerMissing, integerMissing, realMissing)
+
+  ! restart drop off time
+  select case(trim(restart_write))
+    case('last','Last')
+      call process_time(trim(simEnd), calendar, restartJulday, ierr, cmessage)
+      if(ierr/=0) then; message=trim(message)//trim(cmessage)//' [restartDate]'; return; endif
+    case('never','Never')
+      restartJulday = 0.0_dp
+    case('specified','Specified')
+      if (trim(restart_date) == charMissing) then
+        ierr=20; message=trim(message)//'<restart_date> must be provided when <restart_write> option is "specified"'; return
+      end if
+      call process_time(trim(restart_date),calendar, restartJulday, ierr, cmessage)
+      if(ierr/=0) then; message=trim(message)//trim(cmessage)//' [restartDate]'; return; endif
+    case default
+      ierr=20; message=trim(message)//'Current accepted <restart_write> options: last[Last], never[Never], specified[Specified]'; return
+  end select
+
+ END SUBROUTINE init_time_new
+
+
+ ! *********************************************************************
+ ! private subroutine: get the name of input file based on iTime, will be called
+ ! in get_hru_runoff to ajust for file name given iTime
+ ! *********************************************************************
+ SUBROUTINE infile_name(ierr, message)  ! output
+
+  ! subroutines:
+  USE process_time_module, ONLY: process_time  ! process time information
+  USE io_netcdf,           ONLY: get_nc        ! netcdf input
+  ! derived datatype
+  USE dataTypes, ONLY: time           ! time data type
+  ! Shared data
+  USE public_var, ONLY: fname_qsim     ! simulated runoff netCDF name
+  USE globalData, ONLY: iTime           ! time index at simulation time step
+  USE globalData, ONLY: infileinfo_data ! the information of the input files
+  USE globalData, ONLY: iTime_local     ! iTime index for the given netcdf file
+
+  implicit none
+
+  ! output:
+  integer(i4b),              intent(out)   :: ierr             ! error code
+  character(*),              intent(out)   :: message          ! error message
+  ! local variable
+  integer(i4b)                             :: ix
+  !character(len=strLen)                    :: cmessage         ! error message of downwind routine
+
+  ! initialize error control
+  ierr=0; message='infile_name/'
+
+!  print*, "inside infile_name", fname_qsim
+
+  ! fast forward time to time index at simStart and save iTime and modJulday
+  ixloop: do ix = 1, size(infileinfo_data) !loop over number of file
+   if ((iTime >= infileinfo_data(ix)%iTimebound(1)).and.(iTime <= infileinfo_data(ix)%iTimebound(2))) then
+    iTime_local = iTime - infileinfo_data(ix)%iTimebound(1) + 1
+    fname_qsim = trim(infileinfo_data(ix)%infilename)
+    exit ixloop
+   endif
+  enddo ixloop
+
+!  print*, "inside infile_name iTime", iTime
+!  print*, "inside infile_name iTime_local", iTime_local
+!  print*, "inside infile_name file name", fname_qsim
+
+ END SUBROUTINE infile_name
 
  ! *********************************************************************
  ! private subroutine: initialize time data
