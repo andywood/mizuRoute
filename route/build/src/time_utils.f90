@@ -269,7 +269,7 @@ contains
 
  ! initialize errors
  err=0; message="compcalday"
- if(julday<=0)then;err=10;message=trim(message)//"no negative julian days/"; return; end if
+ if(julday<=0)then;err=10;message=trim(message)//": no negative julian days/"; return; end if
 
  ! step 1
  step_1a = 4*int(julday)+b
@@ -340,7 +340,7 @@ contains
 
  ! initialize errors
  err=0; message="compcalday_noleap"
- if(julday<=0)then;err=10;message=trim(message)//"no negative julian days/"; return; end if
+ if(julday<=0)then;err=10;message=trim(message)//": no negative julian days/"; return; end if
 
  A = floor(julday+0.5_dp)
  F = julday + 0.5_dp - real(A,kind(dp))
